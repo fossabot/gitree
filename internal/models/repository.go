@@ -87,15 +87,10 @@ func (g *GitStatus) Validate() error {
 	return nil
 }
 
-// IsStandardStatus returns true if the repository is in a standard state:
-// - Branch is "main" or "master"
-// - Has remote configured
-// - No commits ahead or behind
-// - No stashes
-// - No uncommitted changes
-// - No errors
+// IsStandardStatus returns true if the repository is in a standard state.
 func (g *GitStatus) IsStandardStatus() bool {
-	return (g.Branch == "main" || g.Branch == "master") &&
+	// Standard state: on main/master, in sync with remote, no stashes, no changes, no error
+	return (g.Branch == "main" || g.Branch == "master") && //nolint:goconst // "main" and "master" are domain literals
 		g.HasRemote &&
 		g.Ahead == 0 &&
 		g.Behind == 0 &&
@@ -105,15 +100,15 @@ func (g *GitStatus) IsStandardStatus() bool {
 }
 
 // Format returns the formatted Git status string for display with colorization.
-// Examples (with colors disabled):
-//   - [[ main ]] - On main, in sync with remote, no changes (gray brackets)
-//   - [[ main | ↑2 ↓1 ]] - 2 commits ahead, 1 behind (yellow brackets)
-//   - [[ develop | $ * ]] - Has stashes and uncommitted changes (yellow brackets)
-//   - [[ DETACHED ]] - Detached HEAD state (yellow brackets)
-//   - [[ main | ○ ]] - No remote configured (yellow brackets)
-//   - [[ main | error ]] - Partial error retrieving status (yellow brackets)
-//   - [[ N/A | error ]] - Error retrieving status (N/A and error are red, yellow brackets)
 func (g *GitStatus) Format() string {
+	// Examples (with colors disabled):
+	//   - [[ main ]] - On main, in sync with remote, no changes (gray brackets)
+	//   - [[ main | ↑2 ↓1 ]] - 2 commits ahead, 1 behind (yellow brackets)
+	//   - [[ develop | $ * ]] - Has stashes and uncommitted changes (yellow brackets)
+	//   - [[ DETACHED ]] - Detached HEAD state (yellow brackets)
+	//   - [[ main | ○ ]] - No remote configured (yellow brackets)
+	//   - [[ main | error ]] - Partial error retrieving status (yellow brackets)
+	//   - [[ N/A | error ]] - Error retrieving status (N/A and error are red, yellow brackets)
 	var parts []string
 
 	// Branch: gray for main/master, red for N/A, yellow otherwise
@@ -154,8 +149,7 @@ func (g *GitStatus) Format() string {
 		parts = append(parts, redColor("error"))
 	}
 
-	// Build result with brackets (yellow for non-standard status, gray for standard)
-	// and separator
+	// Build result with brackets (yellow for non-standard status, gray for standard) and separator
 	bracketColor := grayColor
 	if !g.IsStandardStatus() {
 		bracketColor = yellowColor
