@@ -1,4 +1,4 @@
-.PHONY: all build format fmt lint vuln test release check_clean clean help cov-integration cov-unit
+.PHONY: all build format fmt lint vuln security test release check_clean clean help cov-integration cov-unit
 
 # Build variables
 VERSION    := $(shell git describe --tags --always --dirty)
@@ -32,6 +32,8 @@ lint: fmt
 vuln:
 	gosec ./...
 	govulncheck
+
+security: vuln
 
 cov-integration:
 	rm -fr "${GOCOVERDIR}" && mkdir -p "${GOCOVERDIR}"
