@@ -41,6 +41,9 @@ Example output:
 - `*` - has uncommitted changes
 - `bare` - bare repository
 
+> [!WARNING]
+> Windows is not currently supported. This tool is designed for Linux and macOS.
+
 ## Installation
 
 ### Homebrew (macOS)
