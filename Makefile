@@ -1,4 +1,4 @@
-.PHONY: all build format fmt lint vuln security test release check_clean clean help cov-integration cov-unit
+.PHONY: all build format fmt lint vuln security test test-race release check_clean clean help cov-integration cov-unit
 
 # Build variables
 VERSION    := $(shell git describe --tags --always --dirty)
@@ -53,6 +53,9 @@ cov-unit:
 
 test:
 	go test ./...
+
+test-race:
+	go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
 check_clean:
 	@if [ -n "$(shell git status --porcelain)" ]; then \
