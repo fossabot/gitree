@@ -1,15 +1,19 @@
 package gitstatus
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/andreygrechin/gitree/internal/models"
+	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
@@ -35,6 +39,11 @@ const (
 	thresholdSlowOperation = 100 * time.Millisecond
 )
 
+var (
+	errNoRemotes                = errors.New("no remotes configured")
+	errGitignorePathNotAbsolute = errors.New("gitignore path must be absolute")
+)
+
 // debugPrintf formats the message using fmt.Sprintf, adds a "DEBUG: " prefix, and outputs it to stderr.
 func debugPrintf(format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
@@ -50,9 +59,13 @@ func DefaultOptions() *ExtractOptions {
 }
 
 // Extract retrieves Git status information for a single repository.
-func Extract(ctx context.Context, repoPath string, opts *ExtractOptions) (*models.GitStatus, error) {
+func Extract(ctx context.Context, repoPath string, opts *ExtractOptions, ignorePatterns []gitignore.Pattern) (*models.GitStatus, error) {
 	if opts == nil {
 		opts = DefaultOptions()
+	}
+
+	if opts.Debug {
+		debugPrintf("Starting status extraction for repository: %s", repoPath)
 	}
 
 	// Apply timeout if specified
@@ -67,7 +80,7 @@ func Extract(ctx context.Context, repoPath string, opts *ExtractOptions) (*model
 	errorChan := make(chan error, 1)
 
 	go func() {
-		status, err := extractGitStatus(repoPath, opts)
+		status, err := extractGitStatus(repoPath, opts, ignorePatterns)
 		if err != nil {
 			errorChan <- err
 
@@ -100,7 +113,7 @@ func Extract(ctx context.Context, repoPath string, opts *ExtractOptions) (*model
 }
 
 // extractGitStatus performs the actual Git status extraction.
-func extractGitStatus(repoPath string, opts *ExtractOptions) (*models.GitStatus, error) {
+func extractGitStatus(repoPath string, opts *ExtractOptions, ignorePatterns []gitignore.Pattern) (*models.GitStatus, error) {
 	startTime := time.Now()
 
 	// Open repository
@@ -137,7 +150,7 @@ func extractGitStatus(repoPath string, opts *ExtractOptions) (*models.GitStatus,
 	status.HasStashes = extractStashes(repo)
 
 	// Check for uncommitted changes
-	if err := extractUncommittedChanges(repo, status, opts); err != nil {
+	if err := extractUncommittedChanges(repo, status, opts, ignorePatterns); err != nil {
 		// Non-fatal for bare repos
 		if !errors.Is(err, git.ErrIsBareRepository) {
 			if status.Error == "" {
@@ -147,7 +160,7 @@ func extractGitStatus(repoPath string, opts *ExtractOptions) (*models.GitStatus,
 	}
 
 	// Debug output
-	if opts != nil && opts.Debug {
+	if opts.Debug {
 		printDebugSummary(repoPath, status, startTime)
 	}
 
@@ -200,8 +213,6 @@ func extractBranch(repo *git.Repository, status *models.GitStatus) error {
 
 	return nil
 }
-
-var errNoRemotes = errors.New("no remotes configured")
 
 // extractRemote checks if the repository has a remote configured.
 func extractRemote(repo *git.Repository, status *models.GitStatus) error {
@@ -321,6 +332,42 @@ func extractStashes(repo *git.Repository) bool {
 	return stashRef != nil
 }
 
+// readGitignoreFile reads a gitignore file directly and returns patterns.
+func readGitignoreFile(path string) ([]gitignore.Pattern, error) {
+	// Clean the path to prevent directory traversal
+	cleanPath := filepath.Clean(path)
+
+	// Verify the path is absolute to prevent relative path manipulation
+	if !filepath.IsAbs(cleanPath) {
+		return nil, fmt.Errorf("%w: %s", errGitignorePathNotAbsolute, path)
+	}
+
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = f.Close() // Ignore close error on read-only file
+	}()
+
+	scanner := bufio.NewScanner(f)
+	var patterns []gitignore.Pattern
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, gitignore.ParsePattern(line, nil))
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return patterns, nil
+}
+
 // categorizeAndPrintFiles categorizes and prints files with truncation.
 func categorizeAndPrintFiles(wtStatus git.Status) {
 	modifiedFiles := []string{}
@@ -359,26 +406,118 @@ func categorizeAndPrintFiles(wtStatus git.Status) {
 	printFileList("Deleted", deletedFiles)
 }
 
+// loadGlobalIgnorePatterns loads global gitignore patterns from core.excludesfile and default locations.
+func loadGlobalIgnorePatterns(osFS billy.Filesystem, opts *ExtractOptions) ([]gitignore.Pattern, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		if opts.Debug {
+			debugPrintf("Failed to get home directory: %v", err)
+		}
+
+		return nil, fmt.Errorf("failed to get user home directory: %w", err)
+	}
+
+	if opts.Debug {
+		debugPrintf("User home directory: %s", homeDir)
+	}
+
+	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
+	if xdgConfigHome == "" {
+		xdgConfigHome = filepath.Join(homeDir, ".config")
+	}
+
+	debugGlobalIgnoreLocations(osFS, homeDir, xdgConfigHome, opts)
+
+	// Try loading from core.excludesfile first from ~/.gitconfig
+	gitconfigPatterns, err := gitignore.LoadGlobalPatterns(osFS)
+	if err != nil {
+		if opts.Debug {
+			debugPrintf("Failed to load global gitignore patterns from core.excludesfile in ~/.gitconfig: %v", err)
+		}
+	}
+	if gitconfigPatterns != nil {
+		if opts.Debug {
+			debugPrintf("Loaded %d patterns from core.excludesfile", len(gitconfigPatterns))
+		}
+
+		return gitconfigPatterns, nil
+	}
+
+	if opts.Debug {
+		debugPrintf("Failed to load global gitignore patterns from core.excludesfile: %v", err)
+	}
+
+	// Fall back to default location
+	return loadDefaultGlobalIgnore(xdgConfigHome, opts)
+}
+
+// debugGlobalIgnoreLocations prints debug information about gitignore file locations.
+func debugGlobalIgnoreLocations(osFS billy.Filesystem, homeDir, xdgConfigHome string, opts *ExtractOptions) {
+	if !opts.Debug {
+		return
+	}
+
+	gitconfigPath := filepath.Join(homeDir, ".gitconfig")
+	debugPrintf("Looking for .gitconfig at: %s", gitconfigPath)
+	if stat, err := osFS.Stat(gitconfigPath); err == nil {
+		debugPrintf(".gitconfig found (size: %d bytes)", stat.Size())
+	} else {
+		debugPrintf(".gitconfig not found or inaccessible: %v", err)
+	}
+
+	defaultIgnorePath := filepath.Join(xdgConfigHome, "git", "ignore")
+	debugPrintf("Checking default global ignore at: %s", defaultIgnorePath)
+	if stat, err := osFS.Stat(defaultIgnorePath); err == nil {
+		debugPrintf("Default global ignore found (size: %d bytes)", stat.Size())
+	} else {
+		debugPrintf("Default global ignore not found: %v", err)
+	}
+}
+
+// loadDefaultGlobalIgnore loads patterns from the default global gitignore location.
+func loadDefaultGlobalIgnore(xdgConfigHome string, opts *ExtractOptions) ([]gitignore.Pattern, error) {
+	defaultIgnorePath := filepath.Join(xdgConfigHome, "git", "ignore")
+	defaultPatterns, err := readGitignoreFile(defaultIgnorePath)
+
+	if err == nil && len(defaultPatterns) > 0 {
+		if opts.Debug {
+			debugPrintf("Loaded %d patterns from default global ignore: %s", len(defaultPatterns), defaultIgnorePath)
+		}
+
+		return defaultPatterns, nil
+	}
+
+	if opts.Debug && err != nil {
+		debugPrintf("Could not read default global ignore: %v", err)
+	}
+
+	return nil, err
+}
+
 // extractUncommittedChanges checks for uncommitted changes in the working tree.
-func extractUncommittedChanges(repo *git.Repository, status *models.GitStatus, opts *ExtractOptions) error {
+func extractUncommittedChanges(
+	repo *git.Repository,
+	status *models.GitStatus,
+	opts *ExtractOptions,
+	ignorePatterns []gitignore.Pattern,
+) error {
 	worktree, err := repo.Worktree()
 	if err != nil {
 		// Likely a bare repository
 		status.HasChanges = false
+		if errors.Is(err, git.ErrIsBareRepository) {
+			return git.ErrIsBareRepository
+		}
 
-		return err
+		return fmt.Errorf("failed to get worktree: %w", err)
 	}
 
-	// Load global gitignore patterns to align with native git behavior
-	globalPatterns, err := gitignore.LoadGlobalPatterns(worktree.Filesystem)
-	if err == nil {
-		worktree.Excludes = append(worktree.Excludes, globalPatterns...)
-	}
-
-	// Load system gitignore patterns
-	systemPatterns, err := gitignore.LoadSystemPatterns(worktree.Filesystem)
-	if err == nil {
-		worktree.Excludes = append(worktree.Excludes, systemPatterns...)
+	// Add pre-loaded global gitignore patterns to align with native git behavior
+	if len(ignorePatterns) > 0 {
+		worktree.Excludes = append(worktree.Excludes, ignorePatterns...)
+		if opts.Debug {
+			debugPrintf("Total excludes after adding global patterns: %d", len(worktree.Excludes))
+		}
 	}
 
 	wtStatus, err := worktree.Status()
@@ -388,8 +527,7 @@ func extractUncommittedChanges(repo *git.Repository, status *models.GitStatus, o
 
 	status.HasChanges = !wtStatus.IsClean()
 
-	// Debug file listing
-	if opts != nil && opts.Debug && status.HasChanges {
+	if opts.Debug && status.HasChanges {
 		categorizeAndPrintFiles(wtStatus)
 	}
 
@@ -406,6 +544,17 @@ func ExtractBatch(
 
 	if len(repos) == 0 {
 		return make(map[string]*models.GitStatus), nil
+	}
+
+	// Load global gitignore patterns once for all repositories
+	osFS := osfs.New("/")
+	ignorePatterns, err := loadGlobalIgnorePatterns(osFS, opts)
+	if err != nil && opts.Debug {
+		debugPrintf("Failed to load global ignore patterns: %v", err)
+	}
+	// Use empty slice if loading failed
+	if ignorePatterns == nil {
+		ignorePatterns = []gitignore.Pattern{}
 	}
 
 	// Create channels
@@ -443,7 +592,7 @@ func ExtractBatch(
 			}
 
 			// Extract status
-			status, err := Extract(ctx, repoPath, opts)
+			status, err := Extract(ctx, repoPath, opts, ignorePatterns)
 			results <- result{
 				path:   repoPath,
 				status: status,
